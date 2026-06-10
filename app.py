@@ -1,31 +1,31 @@
 """
-DR Detection - Flask Microservice
-==================================
-รับรูปภาพ → ตรวจว่าเป็น fundus ไหม → ONNX inference → ส่งผลลัพธ์ JSON
-เพิ่ม /gradcam endpoint สำหรับ Occlusion-based heatmap
+DR Detection + Diabetes Risk - Flask Microservice
+==================================================
+/analyze         → วิเคราะห์จอประสาทตา DR
+/predict-diabetes → ประเมินความเสี่ยงเบาหวานจากข้อมูลสุขภาพ
 """
 
 import os
 import io
-import base64
 import numpy as np
 from PIL import Image
 import onnxruntime as ort
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from scipy.ndimage import gaussian_filter
 
 app = Flask(__name__)
 CORS(app)
 
 # ─── CONFIG ───────────────────────────────────
-MODEL_PATH      = os.environ.get("MODEL_PATH", "model_dr.onnx")
-CLASSIFIER_PATH = os.environ.get("CLASSIFIER_PATH", "fundus_classifier.onnx")
-IMG_SIZE        = 512
-IMG_SIZE_CLS    = 224
+MODEL_PATH        = os.environ.get("MODEL_PATH", "model_dr.onnx")
+CLASSIFIER_PATH   = os.environ.get("CLASSIFIER_PATH", "fundus_classifier.onnx")
+DIABETES_MODEL    = os.environ.get("DIABETES_MODEL", "diabetes_model.onnx")
+DIABETES_SCALER   = os.environ.get("DIABETES_SCALER", "diabetes_scaler.onnx")
+IMG_SIZE          = 512
+IMG_SIZE_CLS      = 224
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-FUNDUS_THRESHOLD = 0.5
+FUNDUS_THRESHOLD  = 0.5
 
 GRADE_NAMES    = ["No DR", "Mild NPDR", "Moderate NPDR", "Severe NPDR", "Proliferative DR"]
 RISK_LEVELS    = ["ไม่พบความเสี่ยง", "ความเสี่ยงต่ำ", "ความเสี่ยงปานกลาง", "ความเสี่ยงสูง", "ความเสี่ยงสูง"]
@@ -66,6 +66,14 @@ cls_input  = sess_cls.get_inputs()[0].name
 cls_output = sess_cls.get_outputs()[0].name
 print("✅ Fundus classifier loaded")
 
+print(f"Loading diabetes models...")
+sess_db_scaler = ort.InferenceSession(DIABETES_SCALER, providers=["CPUExecutionProvider"])
+sess_db_model  = ort.InferenceSession(DIABETES_MODEL,  providers=["CPUExecutionProvider"])
+db_scaler_input = sess_db_scaler.get_inputs()[0].name
+db_model_input  = sess_db_model.get_inputs()[0].name
+db_prob_output  = "output_probability"
+print("✅ Diabetes models loaded")
+
 
 # ─── HELPERS ────────────────────────────────────
 def preprocess(image_bytes: bytes, size: int) -> np.ndarray:
@@ -85,61 +93,6 @@ def is_fundus(image_bytes: bytes) -> tuple[bool, float]:
     logit  = sess_cls.run([cls_output], {cls_input: tensor})[0][0][0]
     prob   = float(1 / (1 + np.exp(-logit)))
     return prob > FUNDUS_THRESHOLD, prob
-
-def compute_occlusion_heatmap(image_bytes: bytes, target_class: int,
-                               patch_size: int = 128, stride: int = 64) -> np.ndarray:
-    """Occlusion sensitivity map — ปิดบังส่วนต่างๆ แล้วดูว่า confidence ลดลงแค่ไหน"""
-    tensor = preprocess(image_bytes, IMG_SIZE)  # (1, 3, 512, 512)
-
-    # baseline confidence
-    base_logits = sess_dr.run([dr_output], {dr_input: tensor})[0][0]
-    base_prob   = softmax(base_logits)[target_class]
-
-    h, w   = IMG_SIZE, IMG_SIZE
-    heatmap = np.zeros((h, w), dtype=np.float32)
-    count   = np.zeros((h, w), dtype=np.float32)
-
-    for y in range(0, h - patch_size + 1, stride):
-        for x in range(0, w - patch_size + 1, stride):
-            occluded = tensor.copy()
-            occluded[0, :, y:y+patch_size, x:x+patch_size] = 0.0  # ปิดด้วย black
-
-            logits = sess_dr.run([dr_output], {dr_input: occluded})[0][0]
-            prob   = softmax(logits)[target_class]
-
-            importance = base_prob - prob  # ยิ่งตกมาก ยิ่งสำคัญ
-            heatmap[y:y+patch_size, x:x+patch_size] += importance
-            count[y:y+patch_size, x:x+patch_size]   += 1
-
-    count = np.maximum(count, 1)
-    heatmap /= count
-    heatmap  = gaussian_filter(heatmap, sigma=patch_size // 4)
-
-    # normalize 0-1
-    hmin, hmax = heatmap.min(), heatmap.max()
-    if hmax - hmin > 1e-6:
-        heatmap = (heatmap - hmin) / (hmax - hmin)
-
-    return heatmap
-
-def heatmap_to_overlay(image_bytes: bytes, heatmap: np.ndarray) -> str:
-    """แปลง heatmap เป็น base64 image ที่ทับบนรูปต้นฉบับ"""
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
-    img_arr = np.array(img, dtype=np.float32)
-
-    # colormap jet: blue→green→yellow→red
-    h = heatmap
-    r = np.clip(1.5 - np.abs(h * 4 - 3), 0, 1)
-    g = np.clip(1.5 - np.abs(h * 4 - 2), 0, 1)
-    b = np.clip(1.5 - np.abs(h * 4 - 1), 0, 1)
-    colormap = np.stack([r, g, b], axis=-1) * 255
-
-    alpha   = 0.5
-    overlay = (img_arr * (1 - alpha) + colormap * alpha).clip(0, 255).astype(np.uint8)
-
-    buf = io.BytesIO()
-    Image.fromarray(overlay).save(buf, format="JPEG", quality=85)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 # ─── ROUTES ─────────────────────────────────────
@@ -193,20 +146,80 @@ def analyze():
         return jsonify({"error": f"เกิดข้อผิดพลาดในการวิเคราะห์: {str(e)}"}), 500
 
 
-@app.route("/gradcam", methods=["POST"])
-def gradcam():
-    """คำนวณ occlusion heatmap แล้วส่งกลับเป็น base64 image"""
-    if "image" not in request.files:
-        return jsonify({"error": "กรุณาอัปโหลดภาพ"}), 400
-
-    file        = request.files["image"]
-    image_bytes = file.read()
-    grade_idx   = int(request.form.get("gradeIdx", 0))
-
+@app.route("/predict-diabetes", methods=["POST"])
+def predict_diabetes():
+    """
+    รับ JSON: { pregnancies, glucose, bloodPressure, skinThickness,
+                insulin, bmi, diabetesPedigree, age }
+    ส่งกลับ: { risk, probability, riskLevel, recommendations }
+    """
     try:
-        heatmap    = compute_occlusion_heatmap(image_bytes, grade_idx)
-        overlay_b64 = heatmap_to_overlay(image_bytes, heatmap)
-        return jsonify({"success": True, "heatmap": overlay_b64})
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "กรุณาส่งข้อมูลสุขภาพ"}), 400
+
+        required = ["pregnancies", "glucose", "bloodPressure", "skinThickness",
+                    "insulin", "bmi", "diabetesPedigree", "age"]
+        for field in required:
+            if field not in data:
+                return jsonify({"error": f"ข้อมูลไม่ครบ: ขาด {field}"}), 400
+
+        features = np.array([[
+            float(data["pregnancies"]),
+            float(data["glucose"]),
+            float(data["bloodPressure"]),
+            float(data["skinThickness"]),
+            float(data["insulin"]),
+            float(data["bmi"]),
+            float(data["diabetesPedigree"]),
+            float(data["age"]),
+        ]], dtype=np.float32)
+
+        # Scale
+        scaled = sess_db_scaler.run(None, {db_scaler_input: features})[0]
+
+        # Predict
+        outputs   = sess_db_model.run(None, {db_model_input: scaled})
+        label     = int(outputs[0][0])
+        prob_dict = outputs[1][0]
+        prob      = float(prob_dict[1]) * 100
+
+        # Risk level
+        if prob < 30:
+            risk_level = "ความเสี่ยงต่ำ"
+            recommendations = [
+                "รักษาน้ำหนักให้อยู่ในเกณฑ์ปกติ",
+                "ออกกำลังกายสม่ำเสมออย่างน้อย 150 นาทีต่อสัปดาห์",
+                "ตรวจระดับน้ำตาลในเลือดปีละ 1 ครั้ง",
+            ]
+        elif prob < 60:
+            risk_level = "ความเสี่ยงปานกลาง"
+            recommendations = [
+                "ควบคุมอาหาร ลดน้ำตาลและแป้งขัดสี",
+                "ออกกำลังกายสม่ำเสมอ",
+                "ตรวจระดับน้ำตาลในเลือดทุก 6 เดือน",
+                "ปรึกษาแพทย์เพื่อประเมินความเสี่ยงเพิ่มเติม",
+            ]
+        else:
+            risk_level = "ความเสี่ยงสูง"
+            recommendations = [
+                "พบแพทย์เพื่อตรวจวินิจฉัยโดยเร็ว",
+                "ตรวจ HbA1c และ Fasting Blood Glucose",
+                "ควบคุมอาหารและน้ำหนักอย่างเคร่งครัด",
+                "ติดตามระดับน้ำตาลในเลือดอย่างสม่ำเสมอ",
+            ]
+
+        return jsonify({
+            "success": True,
+            "result": {
+                "label":           label,
+                "probability":     round(prob, 1),
+                "riskLevel":       risk_level,
+                "recommendations": recommendations,
+                "hasDiabetes":     label == 1,
+            }
+        })
+
     except Exception as e:
         return jsonify({"error": f"เกิดข้อผิดพลาด: {str(e)}"}), 500
 

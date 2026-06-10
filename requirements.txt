@@ -4,4 +4,3 @@ onnxruntime==1.26.0
 Pillow==11.3.0
 numpy==2.2.5
 gunicorn==23.0.0
-scipy==1.15.3
