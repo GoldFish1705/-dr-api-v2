@@ -87,7 +87,7 @@ def is_fundus(image_bytes: bytes) -> tuple[bool, float]:
     return prob > FUNDUS_THRESHOLD, prob
 
 def compute_occlusion_heatmap(image_bytes: bytes, target_class: int,
-                               patch_size: int = 64, stride: int = 32) -> np.ndarray:
+                               patch_size: int = 128, stride: int = 64) -> np.ndarray:
     """Occlusion sensitivity map — ปิดบังส่วนต่างๆ แล้วดูว่า confidence ลดลงแค่ไหน"""
     tensor = preprocess(image_bytes, IMG_SIZE)  # (1, 3, 512, 512)
 
